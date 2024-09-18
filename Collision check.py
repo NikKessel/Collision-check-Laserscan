@@ -1,8 +1,11 @@
 import sys
+import json
 import numpy as np
 from plyfile import PlyData
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog
 from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 class BuildingInterior:
     def __init__(self, ply_path):
@@ -47,17 +50,16 @@ class UserShape:
 def check_collision(building, user_shape, tolerance=0.1):
     collision_points = []
     
-    # Check each point in the building
     for point in building.points:
         if user_shape.is_point_inside(point):
-            collision_points.append(point)
+            collision_points.append(point.tolist())  # Convert to list for JSON serialization
     
-    # Check for near-collisions
-    if not collision_points:
-        near_points = building.kdtree.query_ball_point(user_shape.parameters['position'], tolerance)
-        collision_points = [building.points[i] for i in near_points]
-    
-    return collision_points
+    if collision_points:
+        return collision_points, None, None
+    else:
+        distance, index = building.kdtree.query(user_shape.parameters['position'])
+        nearest_point = building.points[index].tolist()  # Convert to list for JSON serialization
+        return [], nearest_point, distance
 
 class CollisionDetectorGUI(QWidget):
     def __init__(self):
@@ -69,9 +71,12 @@ class CollisionDetectorGUI(QWidget):
         
         # PLY file path input
         ply_layout = QHBoxLayout()
-        ply_layout.addWidget(QLabel('PLY File Path:'))
-        self.ply_path_input = QLineEdit(r"C:\Users\KesselN\Downloads\prediction_scene1000_00.ply")
+        ply_layout.addWidget(QLabel('PLY File:'))
+        self.ply_path_input = QLineEdit()
         ply_layout.addWidget(self.ply_path_input)
+        self.browse_button = QPushButton('Browse')
+        self.browse_button.clicked.connect(self.browse_file)
+        ply_layout.addWidget(self.browse_button)
         layout.addLayout(ply_layout)
         
         # Shape selection
@@ -105,13 +110,16 @@ class CollisionDetectorGUI(QWidget):
         
         self.setLayout(layout)
         self.setWindowTitle('Collision Detector')
-        self.show()
         
         # Connect shape combo box to update dimension inputs
         self.shape_combo.currentIndexChanged.connect(self.update_dimension_inputs)
         
+    def browse_file(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Select PLY File", "", "PLY Files (*.ply)")
+        if filename:
+            self.ply_path_input.setText(filename)
+    
     def update_dimension_inputs(self):
-        # Clear existing inputs
         for i in reversed(range(self.dim_layout.count())): 
             self.dim_layout.itemAt(i).widget().setParent(None)
         
@@ -131,14 +139,14 @@ class CollisionDetectorGUI(QWidget):
             self.dim_layout.addWidget(self.height_input)
             self.dim_layout.addWidget(QLabel('Axis (x,y,z):'))
             self.axis_input = QLineEdit('0,0,1')
-            self.dim_input = self.axis_input  # For consistency in check_collision method
+            self.dim_input = self.axis_input
         elif shape == 'pyramid':
             self.dim_layout.addWidget(QLabel('Base Size:'))
             self.base_input = QLineEdit('1')
             self.dim_layout.addWidget(self.base_input)
             self.dim_layout.addWidget(QLabel('Height:'))
             self.height_input = QLineEdit('1')
-            self.dim_input = self.height_input  # For consistency in check_collision method
+            self.dim_input = self.height_input
         
         self.dim_layout.addWidget(self.dim_input)
     
@@ -167,17 +175,78 @@ class CollisionDetectorGUI(QWidget):
                 parameters = {'position': position, 'base_size': base_size, 'height': height}
             
             user_shape = UserShape(shape, parameters)
-            collisions = check_collision(building, user_shape)
+            collision_points, nearest_point, distance = check_collision(building, user_shape)
             
-            if collisions:
-                self.result_label.setText(f"Collision detected! {len(collisions)} points in collision.")
+            # Prepare results dictionary
+            results = {
+                "collision": len(collision_points) > 0,
+                "shape": shape,
+                "parameters": parameters
+            }
+            
+            if len(collision_points) > 0:
+                results["collision_points"] = collision_points
+                self.result_label.setText(f"Collision detected! {len(collision_points)} points in collision.")
             else:
-                self.result_label.setText("No collision detected.")
+                results["nearest_point"] = nearest_point
+                results["distance"] = distance
+                self.result_label.setText(f"No collision detected. Nearest point distance: {distance:.2f}")
+            
+            # Save results as JSON
+            with open('collision_results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            self.visualize_results(building, user_shape, collision_points, nearest_point, distance)
         
         except Exception as e:
             self.result_label.setText(f"Error: {str(e)}")
+    
+    def visualize_results(self, building, user_shape, collision_points, nearest_point, distance):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot building points
+        ax.scatter(building.points[:, 0], building.points[:, 1], building.points[:, 2], c='lightblue', s=1, alpha=0.5)
+        
+        # Plot user shape
+        if user_shape.shape_type == 'box':
+            corners = np.array(list(itertools.product(*zip(user_shape.parameters['position'], 
+                                                           user_shape.parameters['position'] + user_shape.parameters['dimensions']))))
+            ax.scatter(corners[:, 0], corners[:, 1], corners[:, 2], c='red', s=50)
+        elif user_shape.shape_type == 'sphere':
+            center = user_shape.parameters['position']
+            ax.scatter(*center, c='red', s=50)
+            # Add wireframe for sphere
+            u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+            x = center[0] + user_shape.parameters['radius'] * np.cos(u) * np.sin(v)
+            y = center[1] + user_shape.parameters['radius'] * np.sin(u) * np.sin(v)
+            z = center[2] + user_shape.parameters['radius'] * np.cos(v)
+            ax.plot_wireframe(x, y, z, color="r", alpha=0.5)
+        # TODO: Add visualization for other shapes
+        
+        # Plot collision points or nearest point
+        if len(collision_points) > 0:
+            collision_points = np.array(collision_points)
+            ax.scatter(collision_points[:, 0], collision_points[:, 1], collision_points[:, 2], c='yellow', s=30)
+            plt.title(f"Collision Detected: {len(collision_points)} points")
+        elif nearest_point is not None:
+            ax.scatter(*nearest_point, c='green', s=50)
+            plt.title(f"No Collision. Nearest Point Distance: {distance:.2f}")
+            # Draw line to nearest point
+            ax.plot([user_shape.parameters['position'][0], nearest_point[0]],
+                    [user_shape.parameters['position'][1], nearest_point[1]],
+                    [user_shape.parameters['position'][2], nearest_point[2]], 'g--')
+        
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        
+        # Save the plot as a PNG file
+        plt.savefig('collision_visualization.png', dpi=300, bbox_inches='tight')
+        plt.close(fig)  # Close the figure to free up memory
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = CollisionDetectorGUI()
+    ex.show()
     sys.exit(app.exec_())
