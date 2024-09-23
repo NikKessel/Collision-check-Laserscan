@@ -1,16 +1,15 @@
 import sys
 import json
 import numpy as np
-from plyfile import PlyData
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog
+from plyfile import PlyData, PlyElement
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+                             QLineEdit, QPushButton, QComboBox, QFileDialog)
 from scipy.spatial import cKDTree
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 class BuildingInterior:
     def __init__(self, ply_path):
-        plydata = PlyData.read(ply_path)
-        self.points = np.column_stack((plydata['vertex']['x'], plydata['vertex']['y'], plydata['vertex']['z']))
+        self.plydata = PlyData.read(ply_path)
+        self.points = np.column_stack((self.plydata['vertex']['x'], self.plydata['vertex']['y'], self.plydata['vertex']['z']))
         self.kdtree = cKDTree(self.points)
 
 class UserShape:
@@ -47,19 +46,63 @@ class UserShape:
                     0 <= z <= height)
         return False
 
+    def get_shape_points(self, resolution=10):
+        if self.shape_type == 'box':
+            min_corner = self.parameters['position']
+            max_corner = min_corner + self.parameters['dimensions']
+            x = np.linspace(min_corner[0], max_corner[0], resolution)
+            y = np.linspace(min_corner[1], max_corner[1], resolution)
+            z = np.linspace(min_corner[2], max_corner[2], resolution)
+            return np.array(np.meshgrid(x, y, z)).T.reshape(-1, 3)
+        elif self.shape_type == 'sphere':
+            center = self.parameters['position']
+            radius = self.parameters['radius']
+            phi = np.linspace(0, np.pi, resolution)
+            theta = np.linspace(0, 2*np.pi, resolution)
+            x = center[0] + radius * np.outer(np.sin(phi), np.cos(theta)).flatten()
+            y = center[1] + radius * np.outer(np.sin(phi), np.sin(theta)).flatten()
+            z = center[2] + radius * np.outer(np.cos(phi), np.ones_like(theta)).flatten()
+            return np.column_stack((x, y, z))
+        elif self.shape_type == 'cylinder':
+            center = self.parameters['position']
+            radius = self.parameters['radius']
+            height = self.parameters['height']
+            axis = self.parameters['axis']
+            theta = np.linspace(0, 2*np.pi, resolution)
+            z = np.linspace(0, height, resolution)
+            theta, z = np.meshgrid(theta, z)
+            x = radius * np.cos(theta)
+            y = radius * np.sin(theta)
+            points = np.column_stack((x.flatten(), y.flatten(), z.flatten()))
+            rotation_matrix = np.array([axis, np.cross([0, 0, 1], axis), [0, 0, 1]]).T
+            points = np.dot(points, rotation_matrix) + center
+            return points
+        elif self.shape_type == 'pyramid':
+            base_center = self.parameters['position']
+            base_size = self.parameters['base_size']
+            height = self.parameters['height']
+            x = np.linspace(-base_size/2, base_size/2, resolution)
+            y = np.linspace(-base_size/2, base_size/2, resolution)
+            z = np.linspace(0, height, resolution)
+            base_points = np.array(np.meshgrid(x, y, [0])).T.reshape(-1, 3)
+            apex_point = np.array([[0, 0, height]])
+            points = np.vstack((base_points, apex_point))
+            return points + base_center
+        return np.array([])
+
 def check_collision(building, user_shape, tolerance=0.1):
     collision_points = []
     
     for point in building.points:
         if user_shape.is_point_inside(point):
-            collision_points.append(point.tolist())  # Convert to list for JSON serialization
+            collision_points.append(point.tolist())
     
     if collision_points:
         return collision_points, None, None
     else:
         distance, index = building.kdtree.query(user_shape.parameters['position'])
-        nearest_point = building.points[index].tolist()  # Convert to list for JSON serialization
-        return [], nearest_point, distance
+        nearest_point = building.points[index].tolist()
+        return [], nearest_point, float(distance)  # Convert distance to float
 
 class CollisionDetectorGUI(QWidget):
     def __init__(self):
@@ -156,10 +199,10 @@ class CollisionDetectorGUI(QWidget):
             building = BuildingInterior(ply_path)
             
             shape = self.shape_combo.currentText()
-            position = np.array([float(x) for x in self.pos_input.text().split(',')])
+            position = [float(x) for x in self.pos_input.text().split(',')]  # Convert to list
             
             if shape == 'box':
-                dimensions = np.array([float(x) for x in self.dim_input.text().split(',')])
+                dimensions = [float(x) for x in self.dim_input.text().split(',')]  # Convert to list
                 parameters = {'position': position, 'dimensions': dimensions}
             elif shape == 'sphere':
                 radius = float(self.dim_input.text())
@@ -167,7 +210,7 @@ class CollisionDetectorGUI(QWidget):
             elif shape == 'cylinder':
                 radius = float(self.radius_input.text())
                 height = float(self.height_input.text())
-                axis = np.array([float(x) for x in self.axis_input.text().split(',')])
+                axis = [float(x) for x in self.axis_input.text().split(',')]  # Convert to list
                 parameters = {'position': position, 'radius': radius, 'height': height, 'axis': axis}
             elif shape == 'pyramid':
                 base_size = float(self.base_input.text())
@@ -196,54 +239,30 @@ class CollisionDetectorGUI(QWidget):
             with open('collision_results.json', 'w') as f:
                 json.dump(results, f, indent=2)
             
-            self.visualize_results(building, user_shape, collision_points, nearest_point, distance)
-        
+            # Add user shape to PLY and save as new file
+            self.add_shape_to_ply(building, user_shape)
+            
         except Exception as e:
             self.result_label.setText(f"Error: {str(e)}")
     
-    def visualize_results(self, building, user_shape, collision_points, nearest_point, distance):
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
+    def add_shape_to_ply(self, building, user_shape):
+        # Get points for the user shape
+        shape_points = user_shape.get_shape_points()
         
-        # Plot building points
-        ax.scatter(building.points[:, 0], building.points[:, 1], building.points[:, 2], c='lightblue', s=1, alpha=0.5)
+        # Combine original points with shape points
+        all_points = np.vstack((building.points, shape_points))
         
-        # Plot user shape
-        if user_shape.shape_type == 'box':
-            corners = np.array(list(itertools.product(*zip(user_shape.parameters['position'], 
-                                                           user_shape.parameters['position'] + user_shape.parameters['dimensions']))))
-            ax.scatter(corners[:, 0], corners[:, 1], corners[:, 2], c='red', s=50)
-        elif user_shape.shape_type == 'sphere':
-            center = user_shape.parameters['position']
-            ax.scatter(*center, c='red', s=50)
-            # Add wireframe for sphere
-            u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
-            x = center[0] + user_shape.parameters['radius'] * np.cos(u) * np.sin(v)
-            y = center[1] + user_shape.parameters['radius'] * np.sin(u) * np.sin(v)
-            z = center[2] + user_shape.parameters['radius'] * np.cos(v)
-            ax.plot_wireframe(x, y, z, color="r", alpha=0.5)
-        # TODO: Add visualization for other shapes
+        # Create a new vertex element
+        vertex = np.array([(p[0], p[1], p[2]) for p in all_points], 
+                          dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
         
-        # Plot collision points or nearest point
-        if len(collision_points) > 0:
-            collision_points = np.array(collision_points)
-            ax.scatter(collision_points[:, 0], collision_points[:, 1], collision_points[:, 2], c='yellow', s=30)
-            plt.title(f"Collision Detected: {len(collision_points)} points")
-        elif nearest_point is not None:
-            ax.scatter(*nearest_point, c='green', s=50)
-            plt.title(f"No Collision. Nearest Point Distance: {distance:.2f}")
-            # Draw line to nearest point
-            ax.plot([user_shape.parameters['position'][0], nearest_point[0]],
-                    [user_shape.parameters['position'][1], nearest_point[1]],
-                    [user_shape.parameters['position'][2], nearest_point[2]], 'g--')
+        # Create a new PlyData object
+        new_plydata = PlyData([PlyElement.describe(vertex, 'vertex')], text=True)
         
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        
-        # Save the plot as a PNG file
-        plt.savefig('collision_visualization.png', dpi=300, bbox_inches='tight')
-        plt.close(fig)  # Close the figure to free up memory
+        # Save the new PLY file
+        output_path = self.ply_path_input.text().replace('.ply', '_with_shape.ply')
+        new_plydata.write(output_path)
+        self.result_label.setText(self.result_label.text() + f"\nNew PLY saved as: {output_path}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
